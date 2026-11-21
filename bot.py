@@ -40,7 +40,10 @@ COMMANDS = {
     "/help": "Show this list of commands",
 }
 
+# Conversation states
 TOPIC, COUNT = range(2)
+CREATE_CAT, CREATE_TEXT, CREATE_CHOICES, CREATE_CORRECT, CREATE_DIFF = range(2, 7)
+
 
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -52,15 +55,18 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Welcome to Quiz Bot! Use the keyboard buttons below to navigate:",
         reply_markup=get_main_menu_keyboard(),
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"{cmd} - {desc}" for cmd, desc in COMMANDS.items()]
     await update.message.reply_text("Available commands:\n" + "\n".join(lines))
+
 
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     target_message = update.message if update.message else update.callback_query.message
@@ -90,6 +96,7 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reply_markup = InlineKeyboardMarkup(keyboard)
     await target_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
+
 async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uname = f"@{user.username}" if user.username else "N/A"
@@ -102,13 +109,137 @@ async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def create_quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "📝 *Create a Quiz*\n\n"
-        "To add your own quiz questions to the bot database, you can use the seed script or API endpoint.\n"
-        "Contact the bot administrator to add new trivia categories and questions!"
+
+# Interactive Quiz Creation Wizard
+async def start_create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "📝 *Create a Quiz Question*\n\nWhat category should this question belong to? (e.g., Science, History, Technology, Pop Culture)",
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    return CREATE_CAT
+
+
+async def receive_create_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_q_cat"] = update.message.text.strip()
+    await update.message.reply_text("Great! Now enter the *question text*:", parse_mode="Markdown")
+    return CREATE_TEXT
+
+
+async def receive_create_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_q_text"] = update.message.text.strip()
+    await update.message.reply_text("Enter *4 choices* separated by commas (e.g., Paris, London, Berlin, Madrid):", parse_mode="Markdown")
+    return CREATE_CHOICES
+
+
+async def receive_create_choices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    choices = [c.strip() for c in update.message.text.split(",")]
+    if len(choices) != 4:
+        await update.message.reply_text("⚠️ Please provide *exactly 4 choices* separated by commas:", parse_mode="Markdown")
+        return CREATE_CHOICES
+    context.user_data["new_q_choices"] = choices
+    await update.message.reply_text("Which choice is the correct answer? Enter a number between *1 and 4*:", parse_mode="Markdown")
+    return CREATE_CORRECT
+
+
+async def receive_create_correct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        val = int(update.message.text.strip())
+        if val < 1 or val > 4:
+            raise ValueError
+        context.user_data["new_q_correct"] = val - 1
+    except ValueError:
+        await update.message.reply_text("⚠️ Please enter a valid number between *1 and 4*:", parse_mode="Markdown")
+        return CREATE_CORRECT
+
+    await update.message.reply_text("Select difficulty level: *easy*, *medium*, or *hard*:", parse_mode="Markdown")
+    return CREATE_DIFF
+
+
+async def receive_create_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    diff = update.message.text.strip().lower()
+    if diff not in ["easy", "medium", "hard"]:
+        diff = "medium"
+
+    cat_name = context.user_data.get("new_q_cat", "General")
+    q_text = context.user_data.get("new_q_text")
+    choices = context.user_data.get("new_q_choices")
+    correct_idx = context.user_data.get("new_q_correct")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{API_URL}/questions",
+                json={
+                    "category_name": cat_name,
+                    "text": q_text,
+                    "choices": choices,
+                    "correct_index": correct_idx,
+                    "difficulty": diff,
+                },
+            )
+            if response.status_code == 200:
+                await update.message.reply_text(
+                    f"🎉 *Success!*\n\nYour question has been added to category *{cat_name}*!",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_menu_keyboard(),
+                )
+            else:
+                cat_resp = await client.post(f"{API_URL}/categories", json={"name": cat_name, "emoji": "💡"})
+                if cat_resp.status_code in [200, 400]:
+                    retry_resp = await client.post(
+                        f"{API_URL}/questions",
+                        json={
+                            "category_name": cat_name,
+                            "text": q_text,
+                            "choices": choices,
+                            "correct_index": correct_idx,
+                            "difficulty": diff,
+                        },
+                    )
+                    if retry_resp.status_code == 200:
+                        await update.message.reply_text(
+                            f"🎉 *Success!*\n\nYour question has been added to category *{cat_name}*!",
+                            parse_mode="Markdown",
+                            reply_markup=get_main_menu_keyboard(),
+                        )
+                    else:
+                        await update.message.reply_text(f"❌ Failed to add question via API: {retry_resp.text}", reply_markup=get_main_menu_keyboard())
+                else:
+                    await update.message.reply_text("❌ Failed to create category via API.", reply_markup=get_main_menu_keyboard())
+    except Exception as e:
+        logging.error(f"Error creating question via API: {e}")
+        try:
+            with Session(engine) as session:
+                cat = session.query(Category).filter_by(name=cat_name).first()
+                if not cat:
+                    cat = Category(name=cat_name, emoji="💡")
+                    session.add(cat)
+                    session.commit()
+                q = Question(
+                    category_id=cat.id,
+                    text=q_text,
+                    choices=choices,
+                    correct_index=correct_idx,
+                    difficulty=diff,
+                )
+                session.add(q)
+                session.commit()
+                await update.message.reply_text(
+                    f"🎉 *Success!*\n\nYour question has been added to category *{cat_name}*!",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_menu_keyboard(),
+                )
+        except Exception as db_e:
+            logging.error(f"DB fallback error: {db_e}")
+            await update.message.reply_text("❌ Error saving question to database.", reply_markup=get_main_menu_keyboard())
+
+    return ConversationHandler.END
+
+
+async def cancel_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Quiz creation cancelled.", reply_markup=get_main_menu_keyboard())
+    return ConversationHandler.END
+
 
 async def quizzes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with Session(engine) as session:
@@ -127,6 +258,7 @@ async def quizzes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
+
 
 async def handle_category_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -149,14 +281,17 @@ async def handle_category_selection(update: Update, context: ContextTypes.DEFAUL
 
             await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+
 async def start_gen_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("✨ What topic would you like the quiz to be about? (e.g., Python, Space, History)")
     return TOPIC
+
 
 async def receive_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["gen_topic"] = update.message.text
     await update.message.reply_text(f"Great! Topic: *{update.message.text}*.\n\nHow many questions do you need? (e.g., 1 to 5)", parse_mode="Markdown")
     return COUNT
+
 
 async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
@@ -212,7 +347,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                     text=q_data["text"],
                     choices=q_data["choices"],
                     correct_index=int(q_data["correct_index"]),
-                    difficulty=q_data.get("difficulty", "medium")
+                    difficulty=q_data.get("difficulty", "medium"),
                 )
                 session.add(new_q)
                 session.commit()
@@ -235,9 +370,11 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     return ConversationHandler.END
 
+
 async def cancel_gen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Quiz generation cancelled.")
     return ConversationHandler.END
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text
@@ -247,8 +384,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await play_command(update, context)
     elif text == "📚 Quizzes":
         await quizzes_handler(update, context)
-    elif text == "📝 Create Quiz":
-        await create_quiz_handler(update, context)
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -265,14 +401,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=f"{query.message.text}\n\n✅ You selected choice {int(idx_str) + 1} for question #{q_id_str}."
         )
 
+
 def main() -> None:
     token = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
         sys.exit("BOT_TOKEN or TELEGRAM_TOKEN environment variable is not set.")
 
     app = Application.builder().token(token).build()
-    
-    conv_handler = ConversationHandler(
+
+    # Conversation handler for AI generation
+    gen_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✨ Generate Quiz$"), start_gen_quiz)],
         states={
             TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_topic)],
@@ -281,14 +419,29 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel_gen)],
     )
 
+    # Conversation handler for interactive quiz creation
+    create_conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📝 Create Quiz$"), start_create_quiz)],
+        states={
+            CREATE_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_create_cat)],
+            CREATE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_create_text)],
+            CREATE_CHOICES: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_create_choices)],
+            CREATE_CORRECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_create_correct)],
+            CREATE_DIFF: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_create_diff)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_create)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("play", play_command))
     app.add_handler(CommandHandler("quizzes", quizzes_handler))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv_handler)
+    app.add_handler(gen_conv_handler)
+    app.add_handler(create_conv_handler)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
